@@ -1,22 +1,41 @@
 /**
- * Blobs en disco (PRD §4.1 «Dónde vive el blob», v1 sin R2).
+ * Blobs: Cloudflare R2 en producción, filesystem en local (PRD §4.1 «Dónde vive el blob»).
  *
- * Cada blob son dos archivos dentro de `BLOB_DIR` (default `apps/web/.data/blobs`):
+ * El backend se elige **por llamada** según `hasR2()` (las cuatro `R2_*` puestas):
  *
- *     {uuid}            el binario tal cual llegó (snapshot gzip o imagen)
- *     {uuid}.meta.json  { contentType, contentEncoding, size, createdAt }
+ *   · `r2Backend`  — un `PUT`/`GET` firmado con SigV4 contra el bucket. El objeto se
+ *     guarda con la key `{uuid}` y su metadata viaja con él, así que **no hay sidecar**:
+ *     una escritura en vez de dos.
  *
- * El sidecar existe porque el `GET` tiene que devolver el mismo `Content-Type` y,
- * en el snapshot, el `Content-Encoding: gzip` para que el browser descomprima solo.
- * El día que entre R2 este módulo se cambia por una firma de PUT al bucket y nada
- * más se mueve.
+ *     El `Content-Type` va como metadata nativa. El `Content-Encoding` **no**: va en
+ *     `x-amz-meta-content-encoding`. Si se guardara como `Content-Encoding` nativo, el
+ *     `GET` de R2 respondería con ese header y el `fetch` de Node/undici gunzipearía
+ *     los bytes por su cuenta (está comprobado: lo hace en Node 24 y en Bun) mientras
+ *     el header sigue diciendo `gzip`. El route reenviaría bytes ya descomprimidos
+ *     etiquetados como comprimidos y el viewer moriría en el `.json()`. Con el header
+ *     custom, undici no toca nada y el gzip llega intacto al browser.
+ *   · `fsBackend`  — dos archivos dentro de `BLOB_DIR` (default `apps/web/.data/blobs`):
  *
- * Solo se puede usar desde el runtime Node.js: toca el filesystem.
+ *         {uuid}            el binario tal cual llegó (snapshot gzip o imagen)
+ *         {uuid}.meta.json  { contentType, contentEncoding, size, createdAt }
+ *
+ *     Se mantiene para que `bun run db:seed` y `next dev` funcionen sin credenciales
+ *     de Cloudflare y sin red.
+ *
+ * En ambos casos el `Content-Encoding: gzip` del snapshot tiene que sobrevivir el
+ * viaje: sin él el viewer hace `.json()` sobre bytes comprimidos y falla.
+ *
+ * El contrato público no cambia: las URLs siguen siendo `{PUNTO_ORIGIN}/api/blobs/{uuid}`
+ * y R2 vive **detrás** de esa ruta, no delante.
+ *
+ * Solo se puede usar desde el runtime Node.js: el backend de disco toca el filesystem.
  */
 import { mkdir, readFile, writeFile } from 'node:fs/promises'
 import path from 'node:path'
 
-import { getEnv } from '../env'
+import { AwsClient } from 'aws4fetch'
+
+import { getEnv, hasR2 } from '../env'
 import { ApiError } from './errors'
 
 /** Tope del body de una subida (PRD §4.1: 5 MB del snapshot comprimido). */
@@ -33,6 +52,11 @@ export type BlobMeta = {
   contentEncoding: string | null
   size: number
   createdAt: string
+}
+
+type BlobBackend = {
+  write(uuid: string, data: Uint8Array, meta: Omit<BlobMeta, 'size' | 'createdAt'>): Promise<BlobMeta>
+  read(uuid: string): Promise<{ data: Buffer; meta: BlobMeta } | null>
 }
 
 /** Solo uuids canónicos: cierra cualquier `..` o `/` en el nombre del archivo. */
@@ -52,23 +76,6 @@ export function blobIdFromUrl(url: string | null | undefined): string | null {
   if (!url) return null
   const candidate = url.split('?')[0]?.split('/').pop() ?? ''
   return isBlobId(candidate) ? candidate : null
-}
-
-function blobDir(): string {
-  const configured = getEnv().BLOB_DIR
-  // `turbopackIgnore`: la ruta es de configuración (BLOB_DIR), no un import — sin
-  // esto Turbopack avisa de que no puede analizar el `path.resolve` dinámico.
-  return path.isAbsolute(configured)
-    ? configured
-    : path.resolve(/* turbopackIgnore: true */ process.cwd(), configured)
-}
-
-function blobPath(uuid: string): string {
-  return path.join(blobDir(), uuid)
-}
-
-function metaPath(uuid: string): string {
-  return `${blobPath(uuid)}.meta.json`
 }
 
 /** Normaliza `application/json; charset=utf-8` → `application/json`. */
@@ -124,61 +131,193 @@ function tooLarge(limit: number): ApiError {
   )
 }
 
-export async function writeBlob(
-  uuid: string,
-  data: Uint8Array,
-  meta: Omit<BlobMeta, 'size' | 'createdAt'>,
-): Promise<BlobMeta> {
-  const dir = blobDir()
-  await mkdir(dir, { recursive: true })
+// ---------------------------------------------------------------------------
+// Backend: Cloudflare R2 (producción)
+// ---------------------------------------------------------------------------
 
-  const full: BlobMeta = {
-    contentType: meta.contentType,
-    contentEncoding: meta.contentEncoding,
-    size: data.byteLength,
-    createdAt: new Date().toISOString(),
+// Cliente perezoso y cacheado, igual que el `hmacKey()` de `lib/blob-token.ts`: crearlo
+// al importar el módulo obligaría a tener credenciales para arrancar cualquier ruta.
+let r2Client: AwsClient | null = null
+let r2ClientForKey: string | null = null
+
+function r2() {
+  const env = getEnv()
+  const accessKeyId = env.R2_ACCESS_KEY_ID
+  const secretAccessKey = env.R2_SECRET_ACCESS_KEY
+  if (!r2Client || r2ClientForKey !== accessKeyId) {
+    r2ClientForKey = accessKeyId
+    // R2 es S3-compatible y no tiene regiones en la firma: `auto` es lo que espera.
+    r2Client = new AwsClient({ accessKeyId, secretAccessKey, service: 's3', region: 'auto' })
   }
+  return r2Client
+}
 
-  await writeFile(blobPath(uuid), data)
-  await writeFile(metaPath(uuid), `${JSON.stringify(full, null, 2)}\n`, 'utf8')
-  return full
+/**
+ * Metadata de usuario donde viaja el `Content-Encoding` del blob. S3 devuelve estos
+ * headers tal cual en el `GET` y —a diferencia de un `Content-Encoding` nativo— ningún
+ * cliente HTTP intenta descomprimir el body por verlos.
+ */
+const R2_ENCODING_META = 'x-amz-meta-content-encoding'
+
+function r2ObjectUrl(uuid: string): string {
+  const env = getEnv()
+  return `https://${env.R2_ACCOUNT_ID}.r2.cloudflarestorage.com/${env.R2_BUCKET}/${uuid}`
+}
+
+/** El status y el body de R2 en el mensaje: un 403 por credenciales no puede parecer un 404. */
+async function r2Failure(action: string, uuid: string, response: Response): Promise<Error> {
+  const body = await response.text().catch(() => '')
+  return new Error(
+    `R2 ${action} de ${uuid} falló con ${response.status} ${response.statusText}: ${body.slice(0, 500)}`,
+  )
+}
+
+const r2Backend: BlobBackend = {
+  async write(uuid, data, meta) {
+    // `Content-Length` no se pone a mano: fetch lo deriva del body.
+    const headers = new Headers({ 'Content-Type': meta.contentType })
+    // Deliberadamente `x-amz-meta-…` y no `Content-Encoding`: ver la cabecera del módulo.
+    if (meta.contentEncoding) headers.set(R2_ENCODING_META, meta.contentEncoding)
+
+    const response = await r2().fetch(r2ObjectUrl(uuid), {
+      method: 'PUT',
+      // El cast solo salva la diferencia `ArrayBufferLike` vs `ArrayBuffer` de los tipos
+      // de `BodyInit`: un `Uint8Array` es un body válido en runtime.
+      body: data as BodyInit,
+      headers,
+    })
+    if (!response.ok) throw await r2Failure('PUT', uuid, response)
+
+    return {
+      contentType: meta.contentType,
+      contentEncoding: meta.contentEncoding,
+      size: data.byteLength,
+      createdAt: new Date().toISOString(),
+    }
+  },
+
+  async read(uuid) {
+    const response = await r2().fetch(r2ObjectUrl(uuid), { method: 'GET' })
+    // El route traduce el `null` a su propio 404.
+    if (response.status === 404) return null
+    if (!response.ok) throw await r2Failure('GET', uuid, response)
+
+    const data = Buffer.from(await response.arrayBuffer())
+    const declaredSize = Number(response.headers.get('content-length'))
+    const lastModified = response.headers.get('last-modified')
+    const modifiedAt = lastModified ? new Date(lastModified) : null
+
+    return {
+      data,
+      meta: {
+        // Mismos defaults tolerantes que el backend de disco.
+        contentType: response.headers.get('content-type') || 'application/octet-stream',
+        contentEncoding: response.headers.get(R2_ENCODING_META) || null,
+        size: Number.isFinite(declaredSize) && declaredSize > 0 ? declaredSize : data.byteLength,
+        createdAt:
+          modifiedAt && !Number.isNaN(modifiedAt.getTime())
+            ? modifiedAt.toISOString()
+            : new Date(0).toISOString(),
+      },
+    }
+  },
+}
+
+// ---------------------------------------------------------------------------
+// Backend: filesystem (desarrollo y `db:seed`)
+// ---------------------------------------------------------------------------
+
+function blobDir(): string {
+  const configured = getEnv().BLOB_DIR
+  // `turbopackIgnore`: la ruta es de configuración (BLOB_DIR), no un import — sin
+  // esto Turbopack avisa de que no puede analizar el `path.resolve` dinámico.
+  return path.isAbsolute(configured)
+    ? configured
+    : path.resolve(/* turbopackIgnore: true */ process.cwd(), configured)
+}
+
+function blobPath(uuid: string): string {
+  return path.join(blobDir(), uuid)
+}
+
+function metaPath(uuid: string): string {
+  return `${blobPath(uuid)}.meta.json`
 }
 
 function isNotFound(error: unknown): boolean {
   return typeof error === 'object' && error !== null && 'code' in error && (error as { code?: unknown }).code === 'ENOENT'
 }
 
-export async function readBlob(uuid: string): Promise<{ data: Buffer; meta: BlobMeta } | null> {
-  let data: Buffer
-  try {
-    data = await readFile(blobPath(uuid))
-  } catch (error) {
-    if (isNotFound(error)) return null
-    throw error
-  }
+const fsBackend: BlobBackend = {
+  async write(uuid, data, meta) {
+    const dir = blobDir()
+    await mkdir(dir, { recursive: true })
 
-  let meta: BlobMeta = {
-    contentType: 'application/octet-stream',
-    contentEncoding: null,
-    size: data.byteLength,
-    createdAt: new Date(0).toISOString(),
-  }
-
-  try {
-    const parsed: unknown = JSON.parse(await readFile(metaPath(uuid), 'utf8'))
-    if (typeof parsed === 'object' && parsed !== null) {
-      const record = parsed as Partial<BlobMeta>
-      meta = {
-        contentType: typeof record.contentType === 'string' ? record.contentType : meta.contentType,
-        contentEncoding: typeof record.contentEncoding === 'string' ? record.contentEncoding : null,
-        size: typeof record.size === 'number' ? record.size : data.byteLength,
-        createdAt: typeof record.createdAt === 'string' ? record.createdAt : meta.createdAt,
-      }
+    const full: BlobMeta = {
+      contentType: meta.contentType,
+      contentEncoding: meta.contentEncoding,
+      size: data.byteLength,
+      createdAt: new Date().toISOString(),
     }
-  } catch (error) {
-    // Sidecar perdido: se sirve como binario opaco en vez de fallar.
-    if (!isNotFound(error)) console.warn('[punto/api] meta de blob ilegible', uuid, error)
-  }
 
-  return { data, meta }
+    await writeFile(blobPath(uuid), data)
+    await writeFile(metaPath(uuid), `${JSON.stringify(full, null, 2)}\n`, 'utf8')
+    return full
+  },
+
+  async read(uuid) {
+    let data: Buffer
+    try {
+      data = await readFile(blobPath(uuid))
+    } catch (error) {
+      if (isNotFound(error)) return null
+      throw error
+    }
+
+    let meta: BlobMeta = {
+      contentType: 'application/octet-stream',
+      contentEncoding: null,
+      size: data.byteLength,
+      createdAt: new Date(0).toISOString(),
+    }
+
+    try {
+      const parsed: unknown = JSON.parse(await readFile(metaPath(uuid), 'utf8'))
+      if (typeof parsed === 'object' && parsed !== null) {
+        const record = parsed as Partial<BlobMeta>
+        meta = {
+          contentType: typeof record.contentType === 'string' ? record.contentType : meta.contentType,
+          contentEncoding: typeof record.contentEncoding === 'string' ? record.contentEncoding : null,
+          size: typeof record.size === 'number' ? record.size : data.byteLength,
+          createdAt: typeof record.createdAt === 'string' ? record.createdAt : meta.createdAt,
+        }
+      }
+    } catch (error) {
+      // Sidecar perdido: se sirve como binario opaco en vez de fallar.
+      if (!isNotFound(error)) console.warn('[punto/api] meta de blob ilegible', uuid, error)
+    }
+
+    return { data, meta }
+  },
+}
+
+// ---------------------------------------------------------------------------
+// Interfaz pública: la misma de siempre. El route handler no se entera del backend.
+// ---------------------------------------------------------------------------
+
+/** Se evalúa por llamada, no al importar: el entorno puede no estar leído todavía. */
+function backend(): BlobBackend {
+  return hasR2() ? r2Backend : fsBackend
+}
+
+export async function writeBlob(
+  uuid: string,
+  data: Uint8Array,
+  meta: Omit<BlobMeta, 'size' | 'createdAt'>,
+): Promise<BlobMeta> {
+  return backend().write(uuid, data, meta)
+}
+
+export async function readBlob(uuid: string): Promise<{ data: Buffer; meta: BlobMeta } | null> {
+  return backend().read(uuid)
 }

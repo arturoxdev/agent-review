@@ -21,6 +21,15 @@
  * | `PORT`                       | no   | scripts de `next dev`/`next start`. Default `3003`             |
  * | `NEXT_PUBLIC_PUNTO_ORIGIN`   | no   | cliente. Default = `PUNTO_ORIGIN`                              |
  * | `NEXT_PUBLIC_PUNTO_DEV_KEY`  | no   | `/dev/host`. Default `pk_dev_armot_local` (la del seed)     |
+ * | `R2_ACCOUNT_ID`              | (*)  | `lib/api/blob-store.ts` (backend R2)                          |
+ * | `R2_BUCKET`                  | (*)  | `lib/api/blob-store.ts` (backend R2)                          |
+ * | `R2_ACCESS_KEY_ID`           | (*)  | `lib/api/blob-store.ts` (backend R2)                          |
+ * | `R2_SECRET_ACCESS_KEY`       | (*)  | `lib/api/blob-store.ts` (backend R2)                          |
+ *
+ * (*) Las cuatro `R2_*` van juntas o no van: si están las cuatro, los blobs viven en
+ * Cloudflare R2 (producción); si falta alguna, `blob-store` cae al filesystem y no se
+ * valida ninguna. Ese «están o no están» lo decide `hasR2()`, que mira `process.env`
+ * en crudo justamente para no disparar la validación de las que sí estén puestas.
  *
  * NOTA: el archivo `.env` vive en la RAÍZ del monorepo. `next dev` solo lee `.env`
  * desde `apps/web`, por eso existe el symlink `apps/web/.env -> ../../.env`.
@@ -66,6 +75,31 @@ const blobDir = z.string().min(1).default('.data/blobs')
 
 const port = z.coerce.number().int().positive().default(3003)
 
+const r2AccountId = z
+  .string()
+  .min(
+    1,
+    'Falta R2_ACCOUNT_ID. dash.cloudflare.com → R2 → Account ID (barra lateral)',
+  )
+
+const r2Bucket = z
+  .string()
+  .min(1, 'Falta R2_BUCKET. Es el nombre del bucket de R2, p.ej. punto-blobs')
+
+const r2AccessKeyId = z
+  .string()
+  .min(
+    1,
+    'Falta R2_ACCESS_KEY_ID. R2 → Manage API tokens → Create API token (Object Read & Write)',
+  )
+
+const r2SecretAccessKey = z
+  .string()
+  .min(
+    1,
+    'Falta R2_SECRET_ACCESS_KEY. Sale junto al Access Key ID y Cloudflare solo lo muestra una vez',
+  )
+
 export type Env = {
   DATABASE_URL: string
   PUNTO_ORIGIN: string
@@ -77,6 +111,14 @@ export type Env = {
   NEXT_PUBLIC_PUNTO_ORIGIN: string
   /** API key que `/dev/host` le pasa al embed. Default: la que crea `db:seed`. */
   NEXT_PUBLIC_PUNTO_DEV_KEY: string
+  /** Account ID de Cloudflare. Solo lo lee el backend R2 de `blob-store`. */
+  R2_ACCOUNT_ID: string
+  /** Bucket de R2 donde viven los blobs en producción. */
+  R2_BUCKET: string
+  /** Access Key ID del token de R2 (permiso Object Read & Write). */
+  R2_ACCESS_KEY_ID: string
+  /** Secret Access Key del token de R2. */
+  R2_SECRET_ACCESS_KEY: string
 }
 
 type Reader<K extends keyof Env> = () => Env[K]
@@ -122,6 +164,14 @@ const readers: { [K in keyof Env]: Reader<K> } = {
     return readers.PUNTO_ORIGIN()
   }),
   NEXT_PUBLIC_PUNTO_DEV_KEY: memo(() => process.env.NEXT_PUBLIC_PUNTO_DEV_KEY || 'pk_dev_armot_local'),
+  R2_ACCOUNT_ID: memo(() => read('R2_ACCOUNT_ID', r2AccountId, process.env.R2_ACCOUNT_ID)),
+  R2_BUCKET: memo(() => read('R2_BUCKET', r2Bucket, process.env.R2_BUCKET)),
+  R2_ACCESS_KEY_ID: memo(() =>
+    read('R2_ACCESS_KEY_ID', r2AccessKeyId, process.env.R2_ACCESS_KEY_ID),
+  ),
+  R2_SECRET_ACCESS_KEY: memo(() =>
+    read('R2_SECRET_ACCESS_KEY', r2SecretAccessKey, process.env.R2_SECRET_ACCESS_KEY),
+  ),
 }
 
 const ENV_KEYS = Object.keys(readers) as (keyof Env)[]
@@ -153,6 +203,22 @@ export const env: Env = new Proxy({} as Env, {
     return { configurable: true, enumerable: true, get: () => readers[prop as keyof Env]() }
   },
 })
+
+/**
+ * ¿Hay credenciales de R2 en el entorno? Decide el backend de `lib/api/blob-store.ts`.
+ *
+ * Lee `process.env` en crudo **a propósito**: preguntar por `env.R2_BUCKET` validaría
+ * la variable y lanzaría en local, que es justo donde no hay R2 y no debe haberlo.
+ * Aquí solo se mira si las cuatro están puestas; el valor lo valida quien lo use.
+ */
+export function hasR2(): boolean {
+  return Boolean(
+    process.env.R2_ACCOUNT_ID &&
+      process.env.R2_BUCKET &&
+      process.env.R2_ACCESS_KEY_ID &&
+      process.env.R2_SECRET_ACCESS_KEY,
+  )
+}
 
 /** URL pública de lectura de un blob: `${PUNTO_ORIGIN}/api/blobs/{uuid}` (PRD §4.1). */
 export function blobReadUrl(uuid: string): string {

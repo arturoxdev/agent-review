@@ -8,6 +8,7 @@
  */
 
 import type { Metadata } from 'next'
+import { notFound } from 'next/navigation'
 
 export const metadata: Metadata = {
   title: 'Host de pruebas · Punto',
@@ -24,6 +25,10 @@ const INSUMOS = [
 ]
 
 export default function DevHostPage() {
+  // Página de pruebas: en producción no existe. `VERCEL_ENV` solo vale 'production'
+  // en el deploy de producción, así que las previews la conservan igual que el local.
+  if (process.env.VERCEL_ENV === 'production') notFound()
+
   return (
     <div className="flex min-h-screen flex-col bg-background text-foreground">
       <header className="sticky top-0 z-10 border-b bg-background/80 backdrop-blur">

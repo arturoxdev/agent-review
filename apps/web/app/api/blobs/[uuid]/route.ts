@@ -7,11 +7,12 @@
  *   · snapshot:  `Content-Type: application/json` + `Content-Encoding: gzip`
  *   · thumbnail: `Content-Type: image/webp` o `image/jpeg`
  *
- * El content-type (y el encoding) se guardan en un sidecar `{uuid}.meta.json` para
- * poder devolverlos en el `GET`: con `Content-Encoding: gzip` el browser descomprime
- * solo y el viewer puede hacer `fetch(snapshotUrl).json()`.
+ * El content-type (y el encoding) se guardan junto al blob para poder devolverlos en
+ * el `GET`: con `Content-Encoding: gzip` el browser descomprime solo y el viewer puede
+ * hacer `fetch(snapshotUrl).json()`. Dónde acaba el binario —Cloudflare R2 o el disco
+ * local— lo decide `lib/api/blob-store.ts`; esta ruta no se entera.
  *
- * Runtime Node.js (default en Next 16): esta ruta escribe en el filesystem.
+ * Runtime Node.js (default en Next 16): el backend de disco toca el filesystem.
  *
  * | Estado | Cuándo |
  * | ------ | ------ |
