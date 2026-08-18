@@ -1,0 +1,165 @@
+/**
+ * Validación de variables de entorno (PRD §4.1, §9).
+ *
+ * **Cada variable se valida sola, y solo cuando alguien la lee.** Eso importa: las
+ * rutas de blobs (`/api/blobs/:uuid`) no tocan la base de datos, así que no pueden
+ * morir porque falte `DATABASE_URL`. Antes se validaba todo el entorno de golpe y un
+ * `.env` sin Neon dejaba caído el `PUT`/`GET` de blobs.
+ *
+ * El mensaje de error sigue siendo explícito: dice qué variable falta, qué se esperaba
+ * y de dónde sacarla.
+ *
+ * Variables (documentadas también en `.env.example` en la raíz del repo):
+ *
+ * | Variable                     | Req. | Quién la lee                                                  |
+ * | ---------------------------- | ---- | ------------------------------------------------------------- |
+ * | `DATABASE_URL`               | sí   | `lib/db/index.ts` (solo las rutas que tocan Postgres)          |
+ * | `PUNTO_ORIGIN`               | sí   | `blobReadUrl`, `signedUploadUrl`, `sessionDocumentUrl`, seed   |
+ * | `BLOB_UPLOAD_SECRET`         | sí   | `lib/blob-token.ts` (firma/verifica los PUT de 15 min)         |
+ * | `SESSION_SECRET`             | sí   | `lib/access-token.ts` (firma/verifica el Acceso del Panel)     |
+ * | `BLOB_DIR`                   | no   | `lib/api/blob-store.ts`. Default `.data/blobs`                 |
+ * | `PORT`                       | no   | scripts de `next dev`/`next start`. Default `3003`             |
+ * | `NEXT_PUBLIC_PUNTO_ORIGIN`   | no   | cliente. Default = `PUNTO_ORIGIN`                              |
+ * | `NEXT_PUBLIC_PUNTO_DEV_KEY`  | no   | `/dev/host`. Default `pk_dev_armot_local` (la del seed)     |
+ *
+ * NOTA: el archivo `.env` vive en la RAÍZ del monorepo. `next dev` solo lee `.env`
+ * desde `apps/web`, por eso existe el symlink `apps/web/.env -> ../../.env`.
+ * Los scripts de Node/Bun (seed, drizzle-kit) cargan la raíz con `dotenv`.
+ */
+import { z } from 'zod'
+
+// ---------------------------------------------------------------------------
+// Esquema por variable. Nada de un `z.object` monolítico: cada entrada se parsea
+// de forma independiente para que una ausencia solo afecte a quien la usa.
+// ---------------------------------------------------------------------------
+
+const databaseUrl = z
+  .string()
+  .min(
+    1,
+    'Falta DATABASE_URL. Neon dashboard → tu proyecto → Connect → Connection string (pooled), termina en ?sslmode=require',
+  )
+  .refine(
+    (value) => value.startsWith('postgres://') || value.startsWith('postgresql://'),
+    'DATABASE_URL debe empezar con postgres:// o postgresql://',
+  )
+
+const puntoOrigin = z
+  .string()
+  .min(1, 'Falta PUNTO_ORIGIN (p.ej. http://localhost:3003)')
+  .refine(
+    (value) => /^https?:\/\//.test(value),
+    'PUNTO_ORIGIN debe ser un origen absoluto, p.ej. http://localhost:3003',
+  )
+  // sin barra final: siempre se concatena como `${origin}/api/...`
+  .transform((value) => value.replace(/\/+$/, ''))
+
+const blobUploadSecret = z
+  .string()
+  .min(16, 'Falta BLOB_UPLOAD_SECRET (mínimo 16 chars). Genera uno con: openssl rand -hex 32')
+
+const sessionSecret = z
+  .string()
+  .min(32, 'Falta SESSION_SECRET (mínimo 32 chars). Genera uno con: openssl rand -base64 32')
+
+const blobDir = z.string().min(1).default('.data/blobs')
+
+const port = z.coerce.number().int().positive().default(3003)
+
+export type Env = {
+  DATABASE_URL: string
+  PUNTO_ORIGIN: string
+  BLOB_UPLOAD_SECRET: string
+  SESSION_SECRET: string
+  BLOB_DIR: string
+  PORT: number
+  /** Origen que el cliente puede usar. Cae a `PUNTO_ORIGIN` si no se definió. */
+  NEXT_PUBLIC_PUNTO_ORIGIN: string
+  /** API key que `/dev/host` le pasa al embed. Default: la que crea `db:seed`. */
+  NEXT_PUBLIC_PUNTO_DEV_KEY: string
+}
+
+type Reader<K extends keyof Env> = () => Env[K]
+
+function read<T>(name: string, schema: z.ZodType<T>, raw: string | undefined): T {
+  const parsed = schema.safeParse(raw ?? '')
+  if (parsed.success) return parsed.data
+
+  const detail = parsed.error.issues.map((issue) => issue.message).join('; ')
+  throw new Error(
+    [
+      `Configuración de entorno inválida: ${name}.`,
+      `  · ${detail}`,
+      'Revisa el `.env` de la raíz del repo (cópialo de `.env.example` si no existe).',
+    ].join('\n'),
+  )
+}
+
+/** Cachea el valor tras la primera lectura correcta; un fallo se vuelve a lanzar. */
+function memo<K extends keyof Env>(fn: Reader<K>): Reader<K> {
+  let cached: { value: Env[K] } | null = null
+  return () => {
+    cached ??= { value: fn() }
+    return cached.value
+  }
+}
+
+const readers: { [K in keyof Env]: Reader<K> } = {
+  DATABASE_URL: memo(() => read('DATABASE_URL', databaseUrl, process.env.DATABASE_URL)),
+  PUNTO_ORIGIN: memo(() => read('PUNTO_ORIGIN', puntoOrigin, process.env.PUNTO_ORIGIN)),
+  BLOB_UPLOAD_SECRET: memo(() =>
+    read('BLOB_UPLOAD_SECRET', blobUploadSecret, process.env.BLOB_UPLOAD_SECRET),
+  ),
+  SESSION_SECRET: memo(() =>
+    read('SESSION_SECRET', sessionSecret, process.env.SESSION_SECRET),
+  ),
+  // Las opcionales tienen `.default()`: `''` no es válido, `undefined` sí.
+  BLOB_DIR: memo(() => read('BLOB_DIR', blobDir, process.env.BLOB_DIR || undefined)),
+  PORT: memo(() => read('PORT', port, process.env.PORT || undefined)),
+  NEXT_PUBLIC_PUNTO_ORIGIN: memo(() => {
+    const explicit = process.env.NEXT_PUBLIC_PUNTO_ORIGIN
+    if (explicit) return read('NEXT_PUBLIC_PUNTO_ORIGIN', puntoOrigin, explicit)
+    return readers.PUNTO_ORIGIN()
+  }),
+  NEXT_PUBLIC_PUNTO_DEV_KEY: memo(() => process.env.NEXT_PUBLIC_PUNTO_DEV_KEY || 'pk_dev_armot_local'),
+}
+
+const ENV_KEYS = Object.keys(readers) as (keyof Env)[]
+
+/**
+ * Env perezoso: `getEnv().BLOB_DIR` valida **solo** `BLOB_DIR`.
+ *
+ * Se mantiene la forma de función (y no un objeto plano) para que ningún import
+ * dispare validación al cargar el módulo.
+ */
+export function getEnv(): Env {
+  return env
+}
+
+/** Azúcar: `env.DATABASE_URL`. Valida esa variable, y solo esa, al leerla. */
+export const env: Env = new Proxy({} as Env, {
+  get(_target, prop: string | symbol) {
+    if (typeof prop !== 'string' || !(prop in readers)) return undefined
+    return readers[prop as keyof Env]()
+  },
+  has(_target, prop) {
+    return typeof prop === 'string' && prop in readers
+  },
+  ownKeys() {
+    return [...ENV_KEYS]
+  },
+  getOwnPropertyDescriptor(_target, prop) {
+    if (typeof prop !== 'string' || !(prop in readers)) return undefined
+    return { configurable: true, enumerable: true, get: () => readers[prop as keyof Env]() }
+  },
+})
+
+/** URL pública de lectura de un blob: `${PUNTO_ORIGIN}/api/blobs/{uuid}` (PRD §4.1). */
+export function blobReadUrl(uuid: string): string {
+  return `${env.PUNTO_ORIGIN}/api/blobs/${uuid}`
+}
+
+/** URL pública del documento de una sesión: `${PUNTO_ORIGIN}/s/{publicId}` (PRD §8). */
+export function sessionDocumentUrl(publicId: string): string {
+  return `${env.PUNTO_ORIGIN}/s/${publicId}`
+}

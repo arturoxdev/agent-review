@@ -1,0 +1,33 @@
+/* Impresión del documento público (PRD §8).
+   Todo lo que Tailwind cubre va con variantes `print:` en el JSX; aquí solo
+   quedan las reglas que no tienen utilidad equivalente. */
+
+@media print {
+  .document {
+    background: white;
+    color: black;
+  }
+
+  /* Nada pegado ni desenfocado en papel. */
+  .document :global(.sticky),
+  .document :global([class*='sticky']) {
+    position: static !important;
+  }
+
+  .document :global([class*='backdrop-blur']) {
+    backdrop-filter: none !important;
+  }
+
+  /* Cada pantalla en su propia página. */
+  .document section {
+    break-inside: avoid;
+  }
+
+  .document section + section {
+    break-before: page;
+  }
+
+  @page {
+    margin: 16mm;
+  }
+}

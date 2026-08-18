@@ -1,0 +1,41 @@
+{
+  "$schema": "https://turbo.build/schema.json",
+  "ui": "stream",
+  "globalDependencies": ["tsconfig.base.json", ".env"],
+  "globalEnv": [
+    "NODE_ENV",
+    "PORT",
+    "DATABASE_URL",
+    "PUNTO_ORIGIN",
+    "BLOB_UPLOAD_SECRET",
+    "BLOB_DIR",
+    "NEXT_PUBLIC_PUNTO_ORIGIN",
+    "NEXT_PUBLIC_PUNTO_DEV_KEY"
+  ],
+  "tasks": {
+    "build": {
+      "dependsOn": ["^build"],
+      "outputs": [".next/**", "!.next/cache/**", "dist/**"]
+    },
+    "dev": {
+      // El embed se emite a apps/web/public/embed.js: sin este `^build`, un clon
+      // limpio arrancaría `next dev` con un /embed.js inexistente.
+      "dependsOn": ["^build"],
+      "cache": false,
+      "persistent": true
+    },
+    "lint": {
+      "dependsOn": ["^build"]
+    },
+    "typecheck": {
+      "dependsOn": ["^build"]
+    },
+    "@punto/embed#build": {
+      "dependsOn": ["^build"],
+      // El artefacto sale FUERA del paquete (apps/web/public/embed.js), y turbo
+      // solo cachea outputs dentro del paquete: por eso no se cachea nunca.
+      "cache": false,
+      "outputs": []
+    }
+  }
+}

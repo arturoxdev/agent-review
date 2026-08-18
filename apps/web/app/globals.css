@@ -1,0 +1,116 @@
+@import 'tailwindcss';
+@import 'tw-animate-css';
+/* Requerido por los componentes shadcn del estilo radix-nova:
+   custom-variants data-open/data-closed/… y utilities scroll-fade/shimmer. */
+@import 'shadcn/tailwind.css';
+
+@custom-variant dark (&:is(.dark *));
+
+:root {
+  --radius: 0.625rem;
+
+  --background: oklch(0.992 0.004 95);
+  --foreground: oklch(0.205 0.012 60);
+  --card: oklch(1 0 0);
+  --card-foreground: oklch(0.205 0.012 60);
+  --popover: oklch(1 0 0);
+  --popover-foreground: oklch(0.205 0.012 60);
+  --primary: oklch(0.24 0.015 60);
+  --primary-foreground: oklch(0.985 0.004 95);
+  --secondary: oklch(0.962 0.005 95);
+  --secondary-foreground: oklch(0.24 0.015 60);
+  --muted: oklch(0.962 0.005 95);
+  --muted-foreground: oklch(0.53 0.012 70);
+  --accent: oklch(0.955 0.006 95);
+  --accent-foreground: oklch(0.24 0.015 60);
+  --destructive: oklch(0.582 0.208 27);
+  --border: oklch(0.912 0.006 90);
+  --input: oklch(0.912 0.006 90);
+  --ring: oklch(0.62 0.25 350);
+
+  /* Señal — solo anotaciones */
+  --signal: oklch(0.62 0.25 350);
+  --signal-foreground: oklch(0.99 0.01 350);
+  --signal-muted: oklch(0.62 0.25 350 / 0.12);
+
+  /* Box model — convención DevTools */
+  --box-content: oklch(0.72 0.13 240 / 0.42);
+  --box-padding: oklch(0.8 0.16 145 / 0.42);
+  --box-border: oklch(0.86 0.15 90 / 0.48);
+  --box-margin: oklch(0.78 0.15 60 / 0.38);
+}
+
+.dark {
+  --background: oklch(0.172 0.008 60);
+  --foreground: oklch(0.962 0.004 95);
+  --card: oklch(0.212 0.009 60);
+  --card-foreground: oklch(0.962 0.004 95);
+  --popover: oklch(0.212 0.009 60);
+  --popover-foreground: oklch(0.962 0.004 95);
+  --primary: oklch(0.962 0.004 95);
+  --primary-foreground: oklch(0.205 0.012 60);
+  --secondary: oklch(0.252 0.009 60);
+  --secondary-foreground: oklch(0.962 0.004 95);
+  --muted: oklch(0.252 0.009 60);
+  --muted-foreground: oklch(0.705 0.01 80);
+  --accent: oklch(0.268 0.01 60);
+  --accent-foreground: oklch(0.962 0.004 95);
+  --destructive: oklch(0.66 0.19 27);
+  --border: oklch(0.292 0.01 60);
+  --input: oklch(0.292 0.01 60);
+  --ring: oklch(0.7 0.22 350);
+
+  --signal: oklch(0.7 0.22 350);
+  --signal-foreground: oklch(0.16 0.02 350);
+  --signal-muted: oklch(0.7 0.22 350 / 0.16);
+}
+
+@theme inline {
+  --color-background: var(--background);
+  --color-foreground: var(--foreground);
+  --color-card: var(--card);
+  --color-card-foreground: var(--card-foreground);
+  --color-popover: var(--popover);
+  --color-popover-foreground: var(--popover-foreground);
+  --color-primary: var(--primary);
+  --color-primary-foreground: var(--primary-foreground);
+  --color-secondary: var(--secondary);
+  --color-secondary-foreground: var(--secondary-foreground);
+  --color-muted: var(--muted);
+  --color-muted-foreground: var(--muted-foreground);
+  --color-accent: var(--accent);
+  --color-accent-foreground: var(--accent-foreground);
+  --color-destructive: var(--destructive);
+  --color-border: var(--border);
+  --color-input: var(--input);
+  --color-ring: var(--ring);
+  --color-signal: var(--signal);
+  --color-signal-foreground: var(--signal-foreground);
+  --color-signal-muted: var(--signal-muted);
+  --color-box-content: var(--box-content);
+  --color-box-padding: var(--box-padding);
+  --color-box-border: var(--box-border);
+  --color-box-margin: var(--box-margin);
+  --radius-sm: calc(var(--radius) - 4px);
+  --radius-md: calc(var(--radius) - 2px);
+  --radius-lg: var(--radius);
+  --font-sans: var(--font-geist-sans);
+  --font-mono: var(--font-geist-mono);
+
+  /* Añadidos por los componentes shadcn radix-nova (rounded-xl, rounded-4xl,
+     font-heading). No sustituyen a ningún token del PRD. */
+  --radius-xl: calc(var(--radius) * 1.4);
+  --radius-2xl: calc(var(--radius) * 1.8);
+  --radius-3xl: calc(var(--radius) * 2.2);
+  --radius-4xl: calc(var(--radius) * 2.6);
+  --font-heading: var(--font-geist-sans);
+}
+
+@layer base {
+  * {
+    @apply border-border outline-ring/50;
+  }
+  body {
+    @apply bg-background text-foreground antialiased;
+  }
+}
