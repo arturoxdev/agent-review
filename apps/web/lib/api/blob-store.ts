@@ -159,6 +159,39 @@ function r2() {
  */
 const R2_ENCODING_META = 'x-amz-meta-content-encoding'
 
+/**
+ * Firma con SigV4 y envía. **No se usa `client.fetch()` a propósito.**
+ *
+ * `aws4fetch` hace internamente `fetch(await this.sign(...))`, es decir le pasa un
+ * objeto `Request`. Si el runtime exige `duplex` al construir un `Request` con body
+ * —undici lo hace en las versiones que corren en Vercel, pero no en la de local— ese
+ * `new Request` lanza `TypeError` y la librería cae a un fallback:
+ *
+ *     new Request(signed.url.toString(), Object.assign({ duplex: 'half' }, signed))
+ *
+ * que rompe dos cosas a la vez: `duplex: 'half'` convierte el body en un stream y se
+ * pierde el `Content-Length` —R2 lo exige en el `PUT` y si no responde
+ * `411 MissingContentLength`— y el `Object.assign` sobre un `Request` no copia
+ * absolutamente nada, porque sus propiedades están en el prototipo, así que la
+ * petición sale además **sin firmar**.
+ *
+ * Firmando por un lado y enviando los bytes con un `fetch(url, init)` normal, undici
+ * calcula el `Content-Length` a partir del `Uint8Array` y ese camino no se pisa nunca.
+ * `Content-Length` no va en `SignedHeaders` (aws4fetch no lo firma), así que que lo
+ * ponga la capa de transporte no invalida la firma.
+ */
+async function r2Fetch(
+  url: string,
+  init: { method: string; headers?: Headers; body?: Uint8Array },
+): Promise<Response> {
+  const signed = await r2().sign(url, init as RequestInit)
+  return fetch(signed.url, {
+    method: init.method,
+    headers: signed.headers,
+    body: init.body as BodyInit | undefined,
+  })
+}
+
 function r2ObjectUrl(uuid: string): string {
   const env = getEnv()
   return `https://${env.R2_ACCOUNT_ID}.r2.cloudflarestorage.com/${env.R2_BUCKET}/${uuid}`
@@ -179,13 +212,7 @@ const r2Backend: BlobBackend = {
     // Deliberadamente `x-amz-meta-…` y no `Content-Encoding`: ver la cabecera del módulo.
     if (meta.contentEncoding) headers.set(R2_ENCODING_META, meta.contentEncoding)
 
-    const response = await r2().fetch(r2ObjectUrl(uuid), {
-      method: 'PUT',
-      // El cast solo salva la diferencia `ArrayBufferLike` vs `ArrayBuffer` de los tipos
-      // de `BodyInit`: un `Uint8Array` es un body válido en runtime.
-      body: data as BodyInit,
-      headers,
-    })
+    const response = await r2Fetch(r2ObjectUrl(uuid), { method: 'PUT', body: data, headers })
     if (!response.ok) throw await r2Failure('PUT', uuid, response)
 
     return {
@@ -197,7 +224,7 @@ const r2Backend: BlobBackend = {
   },
 
   async read(uuid) {
-    const response = await r2().fetch(r2ObjectUrl(uuid), { method: 'GET' })
+    const response = await r2Fetch(r2ObjectUrl(uuid), { method: 'GET' })
     // El route traduce el `null` a su propio 404.
     if (response.status === 404) return null
     if (!response.ok) throw await r2Failure('GET', uuid, response)
